@@ -37,6 +37,7 @@ import {
 } from './middleware-turbopack'
 import { PageNotFoundError } from '../../shared/lib/utils'
 import { debounce } from '../utils'
+import { clearManifestCache } from '../load-manifest.external'
 import { deleteCache } from './require-cache'
 import {
   clearAllModuleContexts,
@@ -162,12 +163,41 @@ declare global {
   var __turbopack_server_hmr_handlers__: Map<string, unknown> | undefined
 }
 
+/**
+ * Collects the output chunk paths touched by a partial HMR update. Both
+ * single-chunk `EcmascriptMergedUpdate`s and `ChunkListUpdate`s (which nest
+ * per-chunk deltas inside `merged`) are flattened so the manifest cache can be
+ * invalidated for every affected chunk after a successful apply.
+ */
+function collectUpdatedChunkPaths(
+  instruction: NodeJsPartialHmrUpdate['instruction']
+): string[] {
+  const paths = new Set<string>()
+  if (instruction.type === 'EcmascriptMergedUpdate') {
+    for (const chunkPath of Object.keys(instruction.chunks ?? {})) {
+      paths.add(chunkPath)
+    }
+  } else if (instruction.type === 'ChunkListUpdate') {
+    for (const chunkPath of Object.keys(instruction.chunks ?? {})) {
+      paths.add(chunkPath)
+    }
+    for (const merged of instruction.merged ?? []) {
+      for (const chunkPath of Object.keys(merged.chunks ?? {})) {
+        paths.add(chunkPath)
+      }
+    }
+  }
+  return Array.from(paths)
+}
+
 function setupServerHmr(
   project: Project,
   {
-    clear,
+    restartServerHmrExpensive,
+    onApplied,
   }: {
-    clear: () => void | Promise<void>
+    restartServerHmrExpensive: () => void | Promise<void>
+    onApplied: (chunkPaths: string[]) => void | Promise<void>
   }
 ) {
   async function runSubscription() {
@@ -179,10 +209,8 @@ function setupServerHmr(
     for await (const result of subscription) {
       const update = result as NodeJsHmrUpdate
 
-      // Fully re-evaluate all chunks from disk. Clears the module cache and
-      // notifies browsers to refetch RSC.
       if (update.type === 'restart') {
-        await clear()
+        await restartServerHmrExpensive()
         continue
       }
 
@@ -191,12 +219,16 @@ function setupServerHmr(
       }
 
       const instruction = update.instruction
-      if (!instruction || instruction.type !== 'EcmascriptMergedUpdate') {
+      if (
+        !instruction ||
+        (instruction.type !== 'EcmascriptMergedUpdate' &&
+          instruction.type !== 'ChunkListUpdate')
+      ) {
         continue
       }
 
-      // No handler registered yet (before first request, or right after
-      // clear()) — nothing live to update, so skip until the next request.
+      // No handler registered yet (before first request, or right after a
+      // restart) — nothing live to update, so skip until the next request.
       const handlers = globalThis.__turbopack_server_hmr_handlers__
       if (!handlers || handlers.size === 0) {
         continue
@@ -204,11 +236,20 @@ function setupServerHmr(
 
       if (typeof __turbopack_server_hmr_apply__ === 'function') {
         const applied = __turbopack_server_hmr_apply__(update)
-        if (!applied) {
-          await clear()
+        if (applied) {
+          const updatedChunkPaths = collectUpdatedChunkPaths(instruction)
+          // An empty partial only advances the version state (e.g. the seed
+          // transition or a new endpoint); nothing was applied in-process, so
+          // don't invalidate manifests or ping browsers to refetch RSC.
+          if (updatedChunkPaths.length > 0) {
+            await onApplied(updatedChunkPaths)
+          }
+        } else {
+          // Partial apply failed; fall back to a full re-evaluation.
+          await restartServerHmrExpensive()
         }
       } else {
-        await clear()
+        await restartServerHmrExpensive()
       }
     }
   }
@@ -216,7 +257,7 @@ function setupServerHmr(
   // Start listening for changes in background. Re-subscribe on error so
   // server Fast Refresh continues working for the rest of the dev session.
   // The delay keeps a persistently-failing subscription (which throws on the
-  // initial read) from hot-looping through clear().
+  // initial read) from hot-looping through restarts.
   ;(async () => {
     for (;;) {
       try {
@@ -224,7 +265,7 @@ function setupServerHmr(
         return
       } catch (err) {
         console.error('[Server HMR] Subscription error, resubscribing:', err)
-        await clear()
+        await restartServerHmrExpensive()
         await new Promise((resolve) => setTimeout(resolve, 1000))
       }
     }
@@ -448,6 +489,15 @@ export async function createHotReloaderTurbopack(
   // Dev specific
   const changeSubscriptions: ChangeSubscriptions = new Map()
   const serverPathState = new Map<string, string>()
+  // The set of server paths written for each edge entry on its previous
+  // `writeToDisk()`. Edge module contexts are cached under a stable module
+  // name and are only evicted by `clearModuleContext(path)` when the path
+  // matches a chunk the live context already loaded. When an edit renames
+  // every one of an edge entry's content-hashed chunks, none of the new paths
+  // match the stale context, so it would never be evicted. Remembering the
+  // previous paths lets us evict via the paths that are being *removed*, which
+  // are exactly the ones the stale context loaded.
+  const edgeServerPaths = new Map<EntryKey, string[]>()
   const readyIds: ReadyIds = new Set()
   let currentEntriesHandlingResolve: ((value?: unknown) => void) | undefined
   let currentEntriesHandling = new Promise(
@@ -568,7 +618,33 @@ export async function createHotReloaderTurbopack(
       }
 
       if (!hasChange) {
-        return false
+        // For non-edge entries, no content change means there is nothing to do.
+        if (writtenEndpoint.type !== 'edge') {
+          return false
+        }
+
+        // Edge entries cache a sandbox module context under a stable module
+        // name, so it must be evicted when the entry's chunks are renamed. A
+        // rename is not observed as a content change above (a new chunk path
+        // simply has no prior hash to compare against), so detect it here as a
+        // chunk path that was loaded previously but is no longer emitted. Only
+        // then is eviction needed: fall through to the edge eviction below.
+        //
+        // When nothing was renamed, the live context is still valid and must be
+        // preserved — tearing it down on an unchanged rebuild would wipe
+        // in-memory module state that has to survive across requests (e.g. a
+        // streaming route handler holding the stream primed by a prior request).
+        const currentRelativePaths = new Set(
+          writtenEndpoint.serverPaths.map(({ path: p }) => p)
+        )
+        const previousRelativePaths = edgeServerPaths.get(key)
+        const hasRenamedChunk =
+          !!previousRelativePaths &&
+          previousRelativePaths.some((p) => !currentRelativePaths.has(p))
+        if (!hasRenamedChunk) {
+          edgeServerPaths.set(key, [...currentRelativePaths])
+          return false
+        }
       }
     }
 
@@ -585,6 +661,30 @@ export async function createHotReloaderTurbopack(
       serverFastRefresh &&
       entryType === 'app' &&
       writtenEndpoint.type !== 'edge'
+
+    // Evict the edge module context for chunks that this edge entry loaded
+    // previously but no longer emits. An edge context is cached under a stable
+    // module name and `clearModuleContext(path)` only evicts it when `path`
+    // matches a chunk the live context already loaded. When an edit renames
+    // every content-hashed chunk of the entry, none of the new `serverPaths`
+    // match the stale context, so without this it would keep serving the old
+    // module. The removed paths are exactly the ones the stale context loaded,
+    // so clearing them evicts it. Only relevant for edge entries; for Node.js
+    // entries the module is re-`require()`d from its new path anyway.
+    if (writtenEndpoint.type === 'edge') {
+      const currentRelativePaths = new Set(
+        writtenEndpoint.serverPaths.map(({ path: p }) => p)
+      )
+      const previousRelativePaths = edgeServerPaths.get(key)
+      if (previousRelativePaths) {
+        for (const previousPath of previousRelativePaths) {
+          if (!currentRelativePaths.has(previousPath)) {
+            clearModuleContext(join(distDir, previousPath))
+          }
+        }
+      }
+      edgeServerPaths.set(key, [...currentRelativePaths])
+    }
 
     const serverChunksPrefix = SERVER_HMR_CHUNKS_DIR + sep
     const filesToDelete: string[] = []
@@ -679,15 +779,22 @@ export async function createHotReloaderTurbopack(
     client.send(data)
   }
 
-  function sendEnqueuedMessages() {
+  function hasCompilationErrors() {
     for (const [, issueMap] of currentEntryIssues) {
       if (
         [...issueMap.values()].filter((i) => i.severity !== 'warning').length >
         0
       ) {
-        // During compilation errors we want to delay the HMR events until errors are fixed
-        return
+        return true
       }
+    }
+    return false
+  }
+
+  function sendEnqueuedMessages() {
+    if (hasCompilationErrors()) {
+      // During compilation errors we want to delay the HMR events until errors are fixed
+      return
     }
 
     for (const client of [
@@ -1781,6 +1888,7 @@ export async function createHotReloaderTurbopack(
                     force: forceDeleteCache,
                   })
                 },
+                serverFastRefresh,
               },
             })
           } finally {
@@ -1918,7 +2026,7 @@ export async function createHotReloaderTurbopack(
 
   if (serverFastRefresh) {
     setupServerHmr(project, {
-      clear: async () => {
+      restartServerHmrExpensive: async () => {
         // Evict every server-HMR-managed chunk from `require.cache`.
         // Trailing `sep` so e.g. `server/chunks-other/...` doesn't match.
         const serverChunksDir = join(distDir, SERVER_HMR_CHUNKS_DIR) + sep
@@ -1942,11 +2050,37 @@ export async function createHotReloaderTurbopack(
 
         resetFetch()
 
-        // Tell browsers to refetch RSC (soft refresh, not full page reload)
-        hotReloader.send({
-          type: HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES,
-          hash: String(++hmrHash),
-        })
+        // Tell browsers to refetch RSC (soft refresh, not full page reload).
+        // Skip while there are outstanding compilation errors: an RSC refetch
+        // would 500 and force a full-page navigation, losing client state. A
+        // subsequent successful compile fires this path again to refresh.
+        if (!hasCompilationErrors()) {
+          hotReloader.send({
+            type: HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES,
+            hash: String(++hmrHash),
+          })
+        }
+      },
+      onApplied: (chunkPaths: string[]) => {
+        // Clear the evalManifest() shared cache for each updated chunk so the
+        // next RSC render picks up the HMR-applied module changes. Unlike
+        // a full restart, this does NOT clear require.cache — the HMR-applied
+        // modules in devModuleCache must persist for dep preservation.
+        for (const chunkPath of chunkPaths) {
+          clearManifestCache(join(distDir, chunkPath))
+        }
+
+        // Notify browsers to refetch RSC after a successful partial HMR apply.
+        // Skip while there are outstanding compilation errors: an RSC refetch
+        // would 500 and force a full-page navigation, losing client state (e.g.
+        // recovering from a syntax error). Once the error is fixed, the next
+        // successful apply fires this path again to refresh.
+        if (!hasCompilationErrors()) {
+          hotReloader.send({
+            type: HMR_MESSAGE_SENT_TO_BROWSER.SERVER_COMPONENT_CHANGES,
+            hash: String(++hmrHash),
+          })
+        }
       },
     })
   }

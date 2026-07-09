@@ -1359,12 +1359,50 @@ impl AppEndpoint {
         {
             client_assets.extend(assets.all_assets().await?.iter().copied());
         }
+        let mut ssr_client_reference_chunks: Vec<ResolvedVc<Box<dyn OutputAsset>>> = vec![];
         for &assets in client_references_chunks_ref
             .client_component_ssr_chunks
             .values()
         {
             // TODO(alexkirsz) In which manifest does this go?
-            server_assets.extend(assets.all_assets().await?.iter().copied());
+            let all = assets.all_assets().await?;
+            server_assets.extend(all.iter().copied());
+            ssr_client_reference_chunks.extend(all.iter().copied());
+        }
+
+        // In development, register a server-side HMR chunk list that owns the
+        // client-component SSR chunks. These chunks are built via separate
+        // chunk_group(IsolatedMerged) calls and aren't part of any entry's own
+        // chunk list, so without this the aggregate server-HMR subscription
+        // never tracks them and edits to a client component aren't reflected in
+        // server-rendered HTML. The anchor gives them a stable-ident
+        // ChunkListVersion so graph changes don't force a restart.
+        //
+        // Server HMR is App Router + Node.js only. The aggregate subscription
+        // scopes what it tracks to entries under `server/app/`, so the anchor
+        // is emitted under this app entry's directory even though the SSR
+        // chunks themselves live in the shared `server/chunks/ssr/`. The Edge
+        // SSR chunking context is a browser-family context without server HMR,
+        // so this is restricted to Node.js.
+        if is_app_page
+            && runtime == NextRuntime::NodeJs
+            && project
+                .client_compile_time_info()
+                .await?
+                .hot_module_replacement_enabled
+        {
+            let ssr_hmr_chunk_list_path = server_path.join(&format!(
+                "app{original_name}/client-components-ssr.js",
+                original_name = app_entry.original_name
+            ))?;
+            let ssr_hmr_chunks = project
+                .server_chunking_context(process_client_assets)
+                .server_hmr_chunk_list(
+                    ssr_hmr_chunk_list_path,
+                    Vc::cell(ssr_client_reference_chunks),
+                )
+                .await?;
+            server_assets.extend(ssr_hmr_chunks.iter().copied());
         }
 
         // In development, register a page-specific HMR chunk list that owns all client
